@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Ignore local model checkpoints and huggingface outputs
+qwen-0.5b-baseline-tuned/
+qwen-0.5b-gauge-rotated/
+qwen-7b-baseline-lora/
+qwen-7b-gauge-rotated/
+llama-7b-baseline-lora/
+llama-7b-gauge-rotated/
+llama-7b-gauge-rotated-unified/
+
+# Ignore large weight files and extracted gauges globally
+*.bin
+*.pt
+*.safetensors
+
+# Ignore Python cache
+__pycache__/
+*.pyc
