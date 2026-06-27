@@ -8,7 +8,7 @@ Requires-Dist: accelerate>=1.13.0
 Requires-Dist: datasets>=4.8.5
 Requires-Dist: einops>=0.8.2
 Requires-Dist: evaluate>=0.4.6
-Requires-Dist: peft>=0.19.1
+Requires-Dist: peft==0.19.1
 Requires-Dist: pytest>=9.1.1
 Requires-Dist: scipy>=1.17.1
 Requires-Dist: sentencepiece>=0.2.1

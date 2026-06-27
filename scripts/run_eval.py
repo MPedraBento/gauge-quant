@@ -64,7 +64,7 @@ def apply_mlp_online_gauges(model, gauges, config, device):
 def calculate_perplexity(model, tokenizer, device, seq_len=2048):
     """Calculates PPL on WikiText-2 test set."""
     model.eval()
-    eval_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", streaming=True)
+    eval_dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test", streaming=True)
     eval_iterator = iter(eval_dataset)
 
     text = ""
