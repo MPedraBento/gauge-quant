@@ -1,47 +1,92 @@
-# Gauge-Quant: Differentiable Gauge Co-Adaptation for LLMs
+# GaugeQuant: Differentiable Gauge Co-Adaptation for LLMs
 
-This repository contains a proof-of-concept for training continuous, differentiable $SO(d)$ gauge symmetries alongside LoRA adapters to organically heal Large Language Models against extreme W4A4 quantization collapse.
-
-Unlike Post-Training Quantization (PTQ) heuristics (e.g., SpinQuant, SmoothQuant) that apply static rotations to frozen networks, this method dynamically co-adapts the network's geometric coordinate space during pre-training to geometrically smear $L_\infty$ activation outliers.
+Learns continuous, differentiable SO(d) gauge symmetries alongside LoRA adapters during pre-training to suppress activation outliers and recover W4A4 quantization collapse.
 
 ## Repository Structure
 
-The codebase is organized into three distinct experimental phases, moving from initial prototyping on small models to full W4A4 quantization recovery on 7B parameter models.
+```
+main.py                        CLI entry point (train / eval)
+configs/
+  qwen_0.5b_unified.yaml      Prototyping config (fits on any GPU)
+  llama2_7b_unified.yaml       Paper target (needs ≥24GB VRAM)
+gauge_quant/
+  modules.py                   AttentionGauge (SO(d)) + BlockDiagonalMLPGauge (SO(64))
+  functional.py                Cayley transform, LogSumExp outlier penalty
+  fusion.py                    Fuses R^T into weight matrices post-training
+  quantization.py              Per-token symmetric fake quantization (W_bits / A_bits)
+scripts/
+  run_train.py                 Dual-graph training loop on streaming C4
+  run_eval.py                  Full ablation: BF16, W4A16, W4A4
+```
 
-### Phase 1: Prototyping (0.5B Model)
-* **`model.py`**: The initial prototyping script. Trains a 0.5B parameter model using full fine-tuning to validate the continuous $SO(d)$ gauge symmetry math on Attention matrices. 
-* **`eval_quant.py`**: Evaluates the 0.5B models (baseline vs. gauge-rotated) under quantization, demonstrating the initial proof-of-concept for outlier suppression.
+## Setup
 
-### Phase 2: Attention-Only Scaling (7B Model)
-* **`model_7b.py`**: Scales the method to 7-Billion parameter models (LLaMA-2). Bypasses massive VRAM requirements by combining frozen base weights, standard LoRA, and gradient checkpointing to isolate continuous gauge adjustments in the Attention $O$-Proj boundaries.
-* **`eval_7b.py`**: W4A4 evaluation script for the Attention-only 7B models. Measures the isolated perplexity recovery when only the Attention geometry is co-adapted.
+```bash
+# Requires Python 3.11, uses uv for dependency management
+uv sync
+```
 
-### Phase 3: Unified Attention + MLP Scaling (7B Model)
-* **`model_7b_mlp.py`**: The unified pre-training script. Injects the Attention gauge *and* a novel $SO(64)$ block-diagonal gauge into the SwiGLU MLP boundaries. Uses aggressive spatial striding (`::64` and `::32`) on the Autograd graph to fit the massive intermediate dimension (11,008) onto a single 16GB consumer GPU.
-* **`eval_7b_mlp.py`**: The ultimate W4A4 evaluation script. Dynamically applies the extracted block-diagonal MLP matrices during the forward pass just before the 4-bit quantizer, proving the network-wide recovery of outlier collapse.
+## Running Experiments
 
-## Quick Start
+### 1. Train (gauge co-adaptation on C4)
 
-1.  **Train the Unified Gauge Model:**
-    ```bash
-    uv run model_7b_mlp.py
-    ```
-    *Note: This script employs aggressive spatial striding to fit on a 16GB RTX 5070 Ti. The gauge is intentionally blind to 98% of the weights to prevent OOM errors.*
+```bash
+# Qwen 0.5B — local prototyping (any GPU)
+uv run main.py train --config configs/qwen_0.5b_unified.yaml
 
-2.  **Evaluate W4A4 Quantization:**
-    ```bash
-    uv run eval_7b_mlp.py
-    ```
+# LLaMA-2 7B — paper experiments (≥24GB VRAM)
+uv run main.py train --config configs/llama2_7b_unified.yaml
+```
 
-## Preliminary Results
+Training streams `allenai/c4` (English) and jointly optimizes:
+- **Base weights** (LoRA or full FT) via Cross-Entropy on next-token prediction
+- **Gauge matrices** via LogSumExp outlier penalty on detached activations
 
-These results reflect a highly constrained local run. The model was trained for just 1,024 steps on the C4 dataset. Due to local VRAM limits, the SwiGLU MLP gauges were optimized using a sparse 1.5% subsample of the weight matrix. 
+Artifacts saved to `output_dir` specified in config: model weights + `gauges.pt`.
 
-Despite the gauge flying blind to 98.5% of the network, the geometric rotation successfully rescued the W4A4 quantizer from total baseline collapse.
+### 2. Evaluate (W4A4 + W4A16 ablation)
 
-| Model (LLaMA-2 7B) | Quantization Regime | Wikitext-2 Perplexity |
-| :--- | :--- | :--- |
-| Vanilla Baseline | W4A4 | 84.04 |
-| **Gauge-Rotated (Ours)** | **W4A4** | **53.35** |
+```bash
+uv run main.py eval \
+  --config configs/llama2_7b_unified.yaml \
+  --checkpoint checkpoints/run_llama2_7b_unified
+```
 
-*(A massive 30-point perplexity recovery purely through intrinsic geometric coordinate rotation).*
+This automatically evaluates **both W4A4 and W4A16** in a single run, producing:
+
+| Condition | BF16 | W4A16 | W4A4 |
+|-----------|------|-------|------|
+| Baseline (vanilla HF) | ✓ | ✓ | ✓ |
+| Control (FT, no gauge) | ✓ | ✓ | ✓ |
+| GaugeQuant (FT + gauge) | ✓ (symmetry check) | ✓ | ✓ |
+
+The symmetry check verifies that `Gauge @ BF16 ≈ Control FT @ BF16` (the rotation is mathematically invisible without quantization).
+
+#### CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--w_bits` | 4 | Weight quantization precision |
+| `--a_bits` | 4 | Activation quantization precision |
+
+If `--a_bits 4`, W4A16 is also tested automatically. Pass `--a_bits 16` to run only W4A16.
+
+### Quantization Details
+
+- **Weights**: per-channel symmetric (scale computed per output channel)
+- **Activations**: per-token symmetric (scale computed per token across hidden dim)
+- **All 7 linear layers** quantized: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`
+- No group quantization — this is a strict per-token regime
+
+## Config Reference
+
+```yaml
+model_id: "meta-llama/Llama-2-7b-hf"  # HuggingFace model ID
+modality: "LoRA"                        # "LoRA" or "Full Fine-Tuning"
+lora_r: 16                              # LoRA rank (ignored if Full Fine-Tuning)
+where: "Unified"                        # "VO" (attention only), "MLP", or "Unified" (both)
+learning_rate: 2.0e-4                   # Gauge optimizer LR
+steps: 2048                             # Training steps on C4
+penalty_weight: 0.1                     # λ for LogSumExp gauge loss
+output_dir: "checkpoints/..."           # Where to save artifacts
+```

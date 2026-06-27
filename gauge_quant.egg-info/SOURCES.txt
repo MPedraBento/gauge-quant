@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+gauge_quant/__init__.py
+gauge_quant/functional.py
+gauge_quant/fusion.py
+gauge_quant/modules.py
+gauge_quant/quantization.py
+gauge_quant.egg-info/PKG-INFO
+gauge_quant.egg-info/SOURCES.txt
+gauge_quant.egg-info/dependency_links.txt
+gauge_quant.egg-info/requires.txt
+gauge_quant.egg-info/top_level.txt
+scripts/__init__.py
+scripts/run_eval.py
+scripts/run_train.py
+tests/test_math.py

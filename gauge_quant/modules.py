@@ -5,42 +5,56 @@ from .functional import cayley_transform
 
 class AttentionGauge(nn.Module):
     """
-    Applies a continuous SO(d) gauge transformation to the Attention projection boundary.
-    It learns a rotation matrix R that rotates the output of W_V before it hits W_O.
+    Block-diagonal SO(head_dim)^num_kv_heads gauge for the V→O attention boundary.
 
-    Invariance check: (X @ W_V) @ R @ R^T @ W_O == X @ W_V @ W_O
+    One independent rotation per KV head group. Query heads sharing the same KV head
+    share the same rotation, which allows full fusion into both v_proj and o_proj
+    with zero runtime cost.
     """
 
-    def __init__(self, hidden_dim: int):
+    def __init__(self, num_kv_heads: int, head_dim: int):
         super().__init__()
-        self.hidden_dim = hidden_dim
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        # One skew-symmetric generator per KV head
+        self.A = nn.Parameter(torch.randn(num_kv_heads, head_dim, head_dim) * 1e-4)
 
-        # A is the underlying parameter that generates the orthogonal matrix R.
-        # Initializing with small random values ensures it starts near the identity matrix.
-        self.A = nn.Parameter(torch.randn(hidden_dim, hidden_dim) * 1e-4)
-
-    def get_rotation(self) -> torch.Tensor:
-        """
-        Computes the strictly orthogonal matrix R via the Cayley transform.
-        """
+    def get_rotation_blocks(self) -> torch.Tensor:
+        """Returns [num_kv_heads, head_dim, head_dim] orthogonal blocks."""
         return cayley_transform(self.A)
+
+    def get_full_rotation(self, num_heads: int) -> torch.Tensor:
+        """
+        Builds the full [hidden_dim, hidden_dim] block-diagonal rotation by repeating
+        each KV-head rotation for all query heads in its group.
+
+        num_heads: total number of query heads
+        """
+        R_blocks = self.get_rotation_blocks()  # [num_kv_heads, head_dim, head_dim]
+        heads_per_kv = num_heads // self.num_kv_heads
+        # Repeat each KV block for the query heads it serves
+        blocks = []
+        for kv_idx in range(self.num_kv_heads):
+            for _ in range(heads_per_kv):
+                blocks.append(R_blocks[kv_idx])
+        return torch.block_diag(*blocks)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Rotates the incoming activation tensor during the training/calibration forward pass.
-        Shape: [batch_size, seq_len, hidden_dim]
+        Rotates activations at the V→O boundary during training.
+        Input x: [batch, seq, num_kv_heads * head_dim] (the V output before broadcast)
         """
-        R = self.get_rotation()
-        # Apply the rotation to the token features
-        return torch.matmul(x, R)
+        shape = x.shape
+        # Reshape to [batch, seq, num_kv_heads, head_dim]
+        x_blocked = x.view(*shape[:-1], self.num_kv_heads, self.head_dim)
+        R_blocks = self.get_rotation_blocks().to(x.dtype)
+        rotated = torch.einsum("bsni,nio->bsno", x_blocked, R_blocks)
+        return rotated.reshape(*shape)
 
 
 class BlockDiagonalMLPGauge(nn.Module):
     """
-    Applies an SO(block_size) block-diagonal gauge transformation to the massive
-    intermediate dimension of the SwiGLU MLP blocks (e.g., 11,008 scaled down to 64-sized blocks).
-
-    This completely avoids the O(d^3) memory/compute overhead of a dense matrix inversion.
+    Block-diagonal SO(block_size)^(d_ff/block_size) gauge for the SwiGLU→down_proj boundary.
     """
 
     def __init__(self, intermediate_dim: int, block_size: int = 64):
@@ -48,38 +62,24 @@ class BlockDiagonalMLPGauge(nn.Module):
         self.intermediate_dim = intermediate_dim
         self.block_size = block_size
 
-        # Determine the number of blocks required to span the entire dimension
         if intermediate_dim % block_size != 0:
             raise ValueError(
-                f"Intermediate dim {intermediate_dim} must be perfectly divisible by block size {block_size}")
+                f"Intermediate dim {intermediate_dim} must be divisible by block size {block_size}")
 
         self.num_blocks = intermediate_dim // block_size
-
-        # Define a batch of skew-symmetric generators: [num_blocks, block_size, block_size]
         self.A = nn.Parameter(torch.randn(self.num_blocks, block_size, block_size) * 1e-4)
 
     def get_rotation_blocks(self) -> torch.Tensor:
-        """
-        Computes a batch of orthogonal blocks.
-        Returns shape: [num_blocks, block_size, block_size]
-        """
+        """Returns [num_blocks, block_size, block_size] orthogonal blocks."""
         return cayley_transform(self.A)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Rotates the activations along the intermediate dimension block by block.
-        Input shape: [batch_size, seq_len, intermediate_dim]
+        Rotates activations at the SwiGLU→down_proj boundary during training.
+        Input x: [batch, seq, intermediate_dim]
         """
         shape = x.shape
-        # 1. Reshape to isolate the blocks: [batch_size, seq_len, num_blocks, block_size]
         x_blocked = x.view(*shape[:-1], self.num_blocks, self.block_size)
-
-        # 2. Get the orthogonal blocks
-        R_blocks = self.get_rotation_blocks()  # [num_blocks, block_size, block_size]
-
-        # 3. Batch matrix multiply across the blocks using einsum for speed and clarity
-        # b: batch, s: seq_len, n: num_blocks, i: input_block_dim, o: output_block_dim
-        rotated_blocked = torch.einsum("bsni,nio->bsno", x_blocked, R_blocks)
-
-        # 4. Flatten back to the original intermediate dimension shape
-        return rotated_blocked.reshape(*shape)
+        R_blocks = self.get_rotation_blocks().to(x.dtype)
+        rotated = torch.einsum("bsni,nio->bsno", x_blocked, R_blocks)
+        return rotated.reshape(*shape)
