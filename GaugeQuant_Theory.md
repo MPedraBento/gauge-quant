@@ -8,6 +8,13 @@ In a standard LLM boundary, hidden activations $H$ are produced by an upstream p
 $$Y = (H \cdot R)(R^T \cdot W_{down}) \equiv H \cdot W_{down}$$
 Because $R \cdot R^T = I$, the mathematical output of the network remains strictly invariant. We merely shift the geometric basis of the intermediate space $H$ to one that is hardware-friendly.
 
+> **Critical invariant: R never rotates the layer input X.**
+> The gauge acts exclusively on *internal boundary representations* between paired projections:
+> - **Attention**: R lives between the V output and O input: $(X W_V) \cdot R \cdot R^T \cdot W_O$
+> - **MLP**: R lives between the SwiGLU output H and down_proj: $H \cdot R \cdot R^T \cdot W_{down}$
+>
+> The input activations X flowing into a transformer block are never touched by R. This is what makes the transformation a true gauge symmetry — it is invisible to the rest of the network.
+
 ## 3. The Cayley Transform (Stiefel Manifold Optimization)
 Standard gradient descent destroys orthogonality ($R^T R \neq I$). To optimize $R$ safely over the Stiefel manifold, we learn a skew-symmetric matrix $A \in \mathbb{R}^{d \times d}$ where $A = -A^T$. 
 We map $A$ to $SO(d)$ via the **Cayley Transform**:

@@ -34,9 +34,10 @@ def test_block_diagonal_gauge():
 
 def test_attention_gauge():
     """Proves the continuous Attention gauge successfully rotates standard hidden states."""
-    hidden_dim = 4096
-    gauge = AttentionGauge(hidden_dim)
-    x = torch.randn(2, 128, hidden_dim)
+    num_kv_heads = 8
+    head_dim = 64
+    gauge = AttentionGauge(num_kv_heads, head_dim)
+    x = torch.randn(2, 128, num_kv_heads * head_dim)
     rotated_x = gauge(x)
 
     assert rotated_x.shape == x.shape, "Attention gauge broke the hidden dimension shape."

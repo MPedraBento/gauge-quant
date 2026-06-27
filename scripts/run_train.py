@@ -14,47 +14,58 @@ logger = logging.getLogger("GaugeQuant.Train")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-class LayerWrapper(torch.nn.Module):
-    """
-    Transparent wrapper enforcing the Dual-Graph Optimization Topology.
-    CE Loss updates the base weights. Gauge Loss strictly updates the R matrices.
-    """
-    def __init__(self, base_layer, gauge, is_mlp=False):
+def get_decoder_layers(model):
+    """Resolves transformer decoder layers regardless of PEFT wrapping."""
+    if hasattr(model, 'peft_config'):  # PeftModel
+        return model.base_model.model.model.layers
+    return model.model.layers
+
+
+class OutputGaugeWrapper(torch.nn.Module):
+    """Wraps v_proj: gauge penalty computed on the layer's OUTPUT (the V output space)."""
+    def __init__(self, base_layer, gauge):
         super().__init__()
         self.base_layer = base_layer
         self.gauge = gauge
-        self.is_mlp = is_mlp
         self.current_penalty = torch.tensor(0.0)
 
     def forward(self, x, *args, **kwargs):
-        with torch.autocast(device_type=x.device.type, dtype=x.dtype):
-            # ========================================================
-            # THE GEOMETER (Gauge Graph - isolated via detach)
-            # ========================================================
-            x_detached = x.detach()
-            rotated_x = self.gauge(x_detached).to(x.dtype)
-            self.current_penalty = logsumexp_outlier_penalty(rotated_x)
+        output = self.base_layer(x, *args, **kwargs)
+        rotated = self.gauge(output.detach())
+        self.current_penalty = logsumexp_outlier_penalty(rotated)
+        return output
 
-        # ========================================================
-        # THE BRAIN (Cross-Entropy Graph - blind to R)
-        # ========================================================
+
+class InputGaugeWrapper(torch.nn.Module):
+    """Wraps down_proj: gauge penalty computed on the layer's INPUT (the SwiGLU output)."""
+    def __init__(self, base_layer, gauge):
+        super().__init__()
+        self.base_layer = base_layer
+        self.gauge = gauge
+        self.current_penalty = torch.tensor(0.0)
+
+    def forward(self, x, *args, **kwargs):
+        rotated = self.gauge(x.detach())
+        self.current_penalty = logsumexp_outlier_penalty(rotated)
         return self.base_layer(x, *args, **kwargs)
 
 
 def inject_gauges(model, config):
     gauges = torch.nn.ModuleList()
-    hidden_dim = model.config.hidden_size
+    layers = get_decoder_layers(model)
+    num_kv_heads = model.config.num_key_value_heads
+    head_dim = model.config.hidden_size // model.config.num_attention_heads
     intermediate_dim = model.config.intermediate_size
 
-    for i, layer in enumerate(model.model.layers):
+    for i, layer in enumerate(layers):
         if config["where"] in ["VO", "Unified"]:
-            vo_gauge = AttentionGauge(hidden_dim).to(model.device)
-            layer.self_attn.o_proj = LayerWrapper(layer.self_attn.o_proj, vo_gauge)
+            vo_gauge = AttentionGauge(num_kv_heads, head_dim).to(model.device)
+            layer.self_attn.v_proj = OutputGaugeWrapper(layer.self_attn.v_proj, vo_gauge)
             gauges.append(vo_gauge)
 
         if config["where"] in ["MLP", "Unified"]:
             mlp_gauge = BlockDiagonalMLPGauge(intermediate_dim, block_size=64).to(model.device)
-            layer.mlp.down_proj = LayerWrapper(layer.mlp.down_proj, mlp_gauge, is_mlp=True)
+            layer.mlp.down_proj = InputGaugeWrapper(layer.mlp.down_proj, mlp_gauge)
             gauges.append(mlp_gauge)
 
     return model, gauges
@@ -62,9 +73,10 @@ def inject_gauges(model, config):
 
 def unwrap_gauges(model):
     """Removes the LayerWrapper so Hugging Face saves standard HF weight keys."""
-    for layer in model.model.layers:
-        if hasattr(layer.self_attn.o_proj, 'base_layer'):
-            layer.self_attn.o_proj = layer.self_attn.o_proj.base_layer
+    layers = get_decoder_layers(model)
+    for layer in layers:
+        if hasattr(layer.self_attn.v_proj, 'base_layer'):
+            layer.self_attn.v_proj = layer.self_attn.v_proj.base_layer
         if hasattr(layer.mlp.down_proj, 'base_layer'):
             layer.mlp.down_proj = layer.mlp.down_proj.base_layer
     return model
@@ -76,11 +88,13 @@ def get_c4_batch(iterator, tokenizer, device, batch_size=1, seq_len=512):
     while len(texts) < batch_size:
         try:
             sample = next(iterator)
-            # Only take samples that are reasonably long
             if len(sample["text"]) > seq_len * 2:
                 texts.append(sample["text"])
         except StopIteration:
             break
+
+    if not texts:
+        raise StopIteration("C4 stream exhausted")
 
     encoded = tokenizer(
         texts,
@@ -120,7 +134,6 @@ def main(args):
         model = get_peft_model(model, lora_config)
         logger.info("LoRA adapters injected successfully.")
     else:
-        # If full fine-tuning, ensure weights require grad
         for param in model.parameters():
             param.requires_grad = True
 
@@ -129,12 +142,12 @@ def main(args):
     logger.info(f"Injected {len(gauges)} continuous gauges ({config['where']} configuration).")
 
     # 4. Joint Optimizer Setup (Mutually Exclusive Groups)
-    gauge_params_set = set(gauges.parameters())
-    base_params = [p for p in model.parameters() if p not in gauge_params_set]
+    gauge_params_set = set(id(p) for p in gauges.parameters())
+    base_params = [p for p in model.parameters() if id(p) not in gauge_params_set and p.requires_grad]
 
     optimizer = torch.optim.AdamW([
         {'params': base_params, 'lr': 2e-5},
-        {'params': gauges.parameters(), 'lr': float(config["learning_rate"])}
+        {'params': list(gauges.parameters()), 'lr': float(config["learning_rate"]), 'weight_decay': 0.0}
     ])
 
     # 5. Load Real C4 Dataset Stream
@@ -146,39 +159,46 @@ def main(args):
     logger.info(f"Starting Joint Optimization on C4 for {config['steps']} steps...")
     model.train()
 
+    log_every = config.get("log_every", 50)
+    os.makedirs(config["output_dir"], exist_ok=True)
+    gauge_log_path = os.path.join(config["output_dir"], "gauge_loss.csv")
+    gauge_log_file = open(gauge_log_path, "w")
+    gauge_log_file.write("step,ce_loss,gauge_loss,total_loss\n")
+
+    layers = get_decoder_layers(model)
+
     for step in tqdm(range(config["steps"])):
-        # Get real linguistic data
         input_ids = get_c4_batch(c4_iterator, tokenizer, device, seq_len=512)
 
-        # Create labels and mask the padding tokens with -100
         labels = input_ids.clone()
         if tokenizer.pad_token_id is not None:
             labels[labels == tokenizer.pad_token_id] = -100
 
-        # Forward Pass
         outputs = model(input_ids, labels=labels)
         ce_loss = outputs.loss
 
-        # Aggregate the Gauge L_infinity penalties
+        # Aggregate Gauge penalties
         gauge_loss = torch.tensor(0.0, device=device)
-        for layer in model.model.layers:
-            if hasattr(layer.self_attn.o_proj, 'current_penalty'):
-                gauge_loss += layer.self_attn.o_proj.current_penalty
+        for layer in layers:
+            if hasattr(layer.self_attn.v_proj, 'current_penalty'):
+                gauge_loss = gauge_loss + layer.self_attn.v_proj.current_penalty
             if hasattr(layer.mlp.down_proj, 'current_penalty'):
-                gauge_loss += layer.mlp.down_proj.current_penalty
+                gauge_loss = gauge_loss + layer.mlp.down_proj.current_penalty
 
-        # Total Objective
-        total_loss = ce_loss + (config["penalty_weight"] * gauge_loss)
+        total_loss = ce_loss + config["penalty_weight"] * gauge_loss
 
-        # Backward Pass & Optimize
         total_loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
-    # 7. Save Artifacts
-    os.makedirs(config["output_dir"], exist_ok=True)
+        if step % log_every == 0:
+            logger.info(f"[Step {step}] CE: {ce_loss.item():.4f} | Gauge: {gauge_loss.item():.4f} | Total: {total_loss.item():.4f}")
+        gauge_log_file.write(f"{step},{ce_loss.item():.6f},{gauge_loss.item():.6f},{total_loss.item():.6f}\n")
 
-    # UNWRAP THE MODEL to restore standard dictionary keys!
+    gauge_log_file.close()
+    logger.info(f"Gauge loss curve saved to {gauge_log_path}")
+
+    # 7. Save Artifacts
     model = unwrap_gauges(model)
 
     if config["modality"] == "LoRA":

@@ -18,3 +18,10 @@ dependencies = [
     "torchvision>=0.20.1",
     "transformers>=5.9.0",
 ]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gauge_quant*", "scripts*"]

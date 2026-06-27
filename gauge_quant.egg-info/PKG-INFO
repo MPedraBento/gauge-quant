@@ -1,0 +1,111 @@
+Metadata-Version: 2.4
+Name: gauge-quant
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: accelerate>=1.13.0
+Requires-Dist: datasets>=4.8.5
+Requires-Dist: einops>=0.8.2
+Requires-Dist: evaluate>=0.4.6
+Requires-Dist: peft>=0.19.1
+Requires-Dist: pytest>=9.1.1
+Requires-Dist: scipy>=1.17.1
+Requires-Dist: sentencepiece>=0.2.1
+Requires-Dist: torch>=2.5.1
+Requires-Dist: torchaudio>=2.5.1
+Requires-Dist: torchvision>=0.20.1
+Requires-Dist: transformers>=5.9.0
+
+# GaugeQuant: Differentiable Gauge Co-Adaptation for LLMs
+
+Learns continuous, differentiable SO(d) gauge symmetries alongside LoRA adapters during pre-training to suppress activation outliers and recover W4A4 quantization collapse.
+
+## Repository Structure
+
+```
+main.py                        CLI entry point (train / eval)
+configs/
+  qwen_0.5b_unified.yaml      Prototyping config (fits on any GPU)
+  llama2_7b_unified.yaml       Paper target (needs ≥24GB VRAM)
+gauge_quant/
+  modules.py                   AttentionGauge (SO(d)) + BlockDiagonalMLPGauge (SO(64))
+  functional.py                Cayley transform, LogSumExp outlier penalty
+  fusion.py                    Fuses R^T into weight matrices post-training
+  quantization.py              Per-token symmetric fake quantization (W_bits / A_bits)
+scripts/
+  run_train.py                 Dual-graph training loop on streaming C4
+  run_eval.py                  Full ablation: BF16, W4A16, W4A4
+```
+
+## Setup
+
+```bash
+# Requires Python 3.11, uses uv for dependency management
+uv sync
+```
+
+## Running Experiments
+
+### 1. Train (gauge co-adaptation on C4)
+
+```bash
+# Qwen 0.5B — local prototyping (any GPU)
+uv run main.py train --config configs/qwen_0.5b_unified.yaml
+
+# LLaMA-2 7B — paper experiments (≥24GB VRAM)
+uv run main.py train --config configs/llama2_7b_unified.yaml
+```
+
+Training streams `allenai/c4` (English) and jointly optimizes:
+- **Base weights** (LoRA or full FT) via Cross-Entropy on next-token prediction
+- **Gauge matrices** via LogSumExp outlier penalty on detached activations
+
+Artifacts saved to `output_dir` specified in config: model weights + `gauges.pt`.
+
+### 2. Evaluate (W4A4 + W4A16 ablation)
+
+```bash
+uv run main.py eval \
+  --config configs/llama2_7b_unified.yaml \
+  --checkpoint checkpoints/run_llama2_7b_unified
+```
+
+This automatically evaluates **both W4A4 and W4A16** in a single run, producing:
+
+| Condition | BF16 | W4A16 | W4A4 |
+|-----------|------|-------|------|
+| Baseline (vanilla HF) | ✓ | ✓ | ✓ |
+| Control (FT, no gauge) | ✓ | ✓ | ✓ |
+| GaugeQuant (FT + gauge) | ✓ (symmetry check) | ✓ | ✓ |
+
+The symmetry check verifies that `Gauge @ BF16 ≈ Control FT @ BF16` (the rotation is mathematically invisible without quantization).
+
+#### CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--w_bits` | 4 | Weight quantization precision |
+| `--a_bits` | 4 | Activation quantization precision |
+
+If `--a_bits 4`, W4A16 is also tested automatically. Pass `--a_bits 16` to run only W4A16.
+
+### Quantization Details
+
+- **Weights**: per-channel symmetric (scale computed per output channel)
+- **Activations**: per-token symmetric (scale computed per token across hidden dim)
+- **All 7 linear layers** quantized: `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`
+- No group quantization — this is a strict per-token regime
+
+## Config Reference
+
+```yaml
+model_id: "meta-llama/Llama-2-7b-hf"  # HuggingFace model ID
+modality: "LoRA"                        # "LoRA" or "Full Fine-Tuning"
+lora_r: 16                              # LoRA rank (ignored if Full Fine-Tuning)
+where: "Unified"                        # "VO" (attention only), "MLP", or "Unified" (both)
+learning_rate: 2.0e-4                   # Gauge optimizer LR
+steps: 2048                             # Training steps on C4
+penalty_weight: 0.1                     # λ for LogSumExp gauge loss
+output_dir: "checkpoints/..."           # Where to save artifacts
+```
