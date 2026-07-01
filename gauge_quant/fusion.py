@@ -18,11 +18,12 @@ def fuse_attention_gauge(model, gauge, layer_idx):
     attn = model.model.layers[layer_idx].self_attn
     num_heads = model.config.num_attention_heads
     R_blocks = gauge.get_rotation_blocks()  # float32 from Cayley
+    weight_device = attn.v_proj.weight.device
 
     # Fuse into v_proj: shape [num_kv_heads * head_dim, hidden_size]
     # We want v_proj output rotated by R: output_new = (x @ W_V^T + b) @ R_v
     # W_V_new = R_v^T @ W_V, b_new = b @ R_v (bias is a row vector)
-    R_v = torch.block_diag(*[R_blocks[i] for i in range(gauge.num_kv_heads)])
+    R_v = torch.block_diag(*[R_blocks[i] for i in range(gauge.num_kv_heads)]).to(weight_device)
     W_v = attn.v_proj.weight.data.float()
     attn.v_proj.weight.data = torch.matmul(R_v.t(), W_v).to(attn.v_proj.weight.dtype)
     if attn.v_proj.bias is not None:
@@ -31,7 +32,7 @@ def fuse_attention_gauge(model, gauge, layer_idx):
 
     # Fuse into o_proj: shape [hidden_size, num_heads * head_dim]
     # Right-multiply by full R (each KV rotation repeated for its query head group)
-    R_full = gauge.get_full_rotation(num_heads)
+    R_full = gauge.get_full_rotation(num_heads).to(weight_device)
     W_o = attn.o_proj.weight.data.float()
     attn.o_proj.weight.data = torch.matmul(W_o, R_full).to(attn.o_proj.weight.dtype)
 
@@ -40,8 +41,9 @@ def fuse_attention_gauge(model, gauge, layer_idx):
 def fuse_mlp_gauge(model, gauge, layer_idx):
     """Fuses R into down_proj input space. Online H@R still needed at inference."""
     R_blocks = gauge.get_rotation_blocks()  # already float32 from Cayley
-    R = torch.block_diag(*[R_blocks[i] for i in range(R_blocks.size(0))])
     layer = model.model.layers[layer_idx].mlp
+    weight_device = layer.down_proj.weight.device
+    R = torch.block_diag(*[R_blocks[i] for i in range(R_blocks.size(0))]).to(weight_device)
     # Compute in float32 to preserve orthogonality, then cast back
     W = layer.down_proj.weight.data.float()
     layer.down_proj.weight.data = torch.matmul(W, R).to(layer.down_proj.weight.dtype)

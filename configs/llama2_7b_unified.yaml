@@ -6,7 +6,7 @@ where: "Unified"  # Applies both Attention and MLP gauges
 
 # Optimization
 learning_rate: 2.0e-4
-steps: 2048
+steps: 8192
 penalty_weight: 0.1
 
 # Artifacts

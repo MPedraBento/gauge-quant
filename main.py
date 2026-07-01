@@ -64,6 +64,12 @@ def main():
         default=4,
         help="Target activation quantization bit-width"
     )
+    eval_parser.add_argument(
+        "--group_size",
+        type=int,
+        default=-1,
+        help="Activation group quantization size (e.g., 128 for g128). -1 = per-token."
+    )
 
     args = parser.parse_args()
 

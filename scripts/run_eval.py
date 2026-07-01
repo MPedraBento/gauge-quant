@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 import yaml
 import logging
@@ -11,6 +12,7 @@ from gauge_quant.modules import AttentionGauge, BlockDiagonalMLPGauge
 from gauge_quant.fusion import apply_all_fusions
 
 logger = logging.getLogger("GaugeQuant.Eval")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 ALL_LINEAR_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
@@ -31,7 +33,7 @@ class OnlineMLPGaugeWrapper(torch.nn.Module):
         return self.base_layer(x_rot, *args, **kwargs)
 
 
-def apply_fake_quantization(model, w_bits, a_bits, target_modules=None):
+def apply_fake_quantization(model, w_bits, a_bits, group_size=-1, target_modules=None):
     """Injects fake quantization into targeted linear layers."""
     if target_modules is None:
         target_modules = ALL_LINEAR_TARGETS
@@ -41,9 +43,9 @@ def apply_fake_quantization(model, w_bits, a_bits, target_modules=None):
             parent_name = name.rsplit('.', 1)[0]
             child_name = name.rsplit('.', 1)[-1]
             parent = model.get_submodule(parent_name)
-            setattr(parent, child_name, QuantizedLinear(module, w_bits=w_bits, a_bits=a_bits))
+            setattr(parent, child_name, QuantizedLinear(module, w_bits=w_bits, a_bits=a_bits, group_size=group_size))
             count += 1
-    logger.info(f"Quantized {count} layers to W{w_bits}A{a_bits}")
+    logger.info(f"Quantized {count} layers to W{w_bits}A{a_bits}" + (f" g{group_size}" if group_size > 0 else " per-token"))
     return model
 
 
@@ -64,7 +66,7 @@ def apply_mlp_online_gauges(model, gauges, config, device):
 def calculate_perplexity(model, tokenizer, device, seq_len=2048):
     """Calculates PPL on WikiText-2 test set."""
     model.eval()
-    eval_dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="test", streaming=True)
+    eval_dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test", streaming=True)
     eval_iterator = iter(eval_dataset)
 
     text = ""
@@ -83,11 +85,11 @@ def calculate_perplexity(model, tokenizer, device, seq_len=2048):
     return torch.exp(outputs.loss).item()
 
 
-def _build_gauge_model(ft_model_weights, gauges, config, device, w_bits, a_bits):
+def _build_gauge_model(ft_model_weights, gauges, config, device, w_bits, a_bits, group_size=-1):
     """Builds a gauge-fused model with quantization and MLP online wrappers."""
     model = copy.deepcopy(ft_model_weights)
     model = apply_all_fusions(model, gauges, config)
-    model = apply_fake_quantization(model, w_bits, a_bits)
+    model = apply_fake_quantization(model, w_bits, a_bits, group_size=group_size)
     model = apply_mlp_online_gauges(model, gauges, config, device)
     return model
 
@@ -144,19 +146,19 @@ def main(args):
     logger.info("--- Baseline (HF) @ BF16 ---")
     model = copy.deepcopy(base_hf_model)
     ppl_base_bf16 = calculate_perplexity(model, tokenizer, device)
-    del model; torch.cuda.empty_cache()
+    del model; gc.collect(); torch.cuda.empty_cache()
 
     logger.info("--- Control (FT) @ BF16 ---")
     model = copy.deepcopy(ft_model_weights).float()
     ppl_ft_bf16 = calculate_perplexity(model, tokenizer, device)
-    del model; torch.cuda.empty_cache()
+    del model; gc.collect(); torch.cuda.empty_cache()
 
     logger.info("--- Gauge (FT) @ BF16 — Symmetry Check (computed in FP32) ---")
     model = copy.deepcopy(ft_model_weights).float()
     model = apply_all_fusions(model, gauges, config)
     model = apply_mlp_online_gauges(model, gauges, config, device)
     ppl_gauge_bf16 = calculate_perplexity(model, tokenizer, device)
-    del model; torch.cuda.empty_cache()
+    del model; gc.collect(); torch.cuda.empty_cache()
 
     # === Quantized evaluations (per regime) ===
 
@@ -167,20 +169,20 @@ def main(args):
 
         logger.info(f"  Baseline @ {tag}")
         model = copy.deepcopy(base_hf_model)
-        model = apply_fake_quantization(model, w_bits, a_bits)
+        model = apply_fake_quantization(model, w_bits, a_bits, group_size=args.group_size)
         ppl_base = calculate_perplexity(model, tokenizer, device)
-        del model; torch.cuda.empty_cache()
+        del model; gc.collect(); torch.cuda.empty_cache()
 
         logger.info(f"  Control (FT) @ {tag}")
         model = copy.deepcopy(ft_model_weights)
-        model = apply_fake_quantization(model, w_bits, a_bits)
+        model = apply_fake_quantization(model, w_bits, a_bits, group_size=args.group_size)
         ppl_control = calculate_perplexity(model, tokenizer, device)
-        del model; torch.cuda.empty_cache()
+        del model; gc.collect(); torch.cuda.empty_cache()
 
         logger.info(f"  GaugeQuant @ {tag}")
-        model = _build_gauge_model(ft_model_weights, gauges, config, device, w_bits, a_bits)
+        model = _build_gauge_model(ft_model_weights, gauges, config, device, w_bits, a_bits, group_size=args.group_size)
         ppl_gauge = calculate_perplexity(model, tokenizer, device)
-        del model; torch.cuda.empty_cache()
+        del model; gc.collect(); torch.cuda.empty_cache()
 
         results[tag] = {"baseline": ppl_base, "control": ppl_control, "gauge": ppl_gauge}
 

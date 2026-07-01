@@ -2,73 +2,101 @@ import torch
 import torch.nn as nn
 
 
-def symmetric_fake_quantize(x: torch.Tensor, bits: int, dim: int = -1) -> torch.Tensor:
+def symmetric_fake_quantize(x: torch.Tensor, bits: int, dim: int = -1, group_size: int = -1) -> torch.Tensor:
     """
-    Applies strict symmetric Min-Max fake quantization.
-    The exact mathematical bottleneck that destroys standard LLMs.
+    Applies symmetric Min-Max fake quantization with optional group quantization.
 
     Args:
         x: The tensor to quantize (weights or activations).
         bits: The target precision (e.g., 4 or 8).
         dim: The dimension to compute the scale over.
-             (e.g., -1 for token-wise activation quantization, or channel-wise weights).
+        group_size: If > 0, splits dim into groups of this size and computes
+                    a separate scale per group. E.g., group_size=128 (g128).
+                    If -1, uses the full dimension (per-token/per-channel).
     """
     if bits >= 16:
         return x
 
-    # 1. Determine the quantization range for signed integers (e.g., 4-bit -> [-8, 7])
     q_max = (1 << (bits - 1)) - 1
     q_min = -(1 << (bits - 1))
 
-    # 2. Find the absolute L_infinity outlier along the specified dimension
-    # Keep dimensions so we can broadcast the scale back across the tensor
-    max_val = x.abs().amax(dim=dim, keepdim=True)
+    if group_size > 0 and x.shape[dim] > group_size:
+        # Group quantization: reshape, quantize per group, reshape back
+        orig_shape = x.shape
+        dim_size = orig_shape[dim]
 
-    # Clamp max_val to avoid division by zero on dead channels
-    max_val = torch.clamp(max_val, min=1e-8)
+        # Pad if not evenly divisible
+        remainder = dim_size % group_size
+        if remainder != 0:
+            pad_size = group_size - remainder
+            pad_shape = list(orig_shape)
+            pad_shape[dim] = pad_size
+            x = torch.cat([x, torch.zeros(pad_shape, device=x.device, dtype=x.dtype)], dim=dim)
 
-    # 3. Compute the step scale
-    scale = max_val / q_max
+        # Reshape to isolate groups
+        new_shape = list(x.shape)
+        new_shape[dim] = x.shape[dim] // group_size
+        new_shape.insert(dim + 1 if dim >= 0 else len(new_shape), group_size)
+        x_grouped = x.reshape(new_shape)
 
-    # 4. Quantize: Divide by scale, round to nearest integer, and clamp to bit-width
-    # We use the Straight-Through Estimator (STE) trick: x_q = (round(x) - x).detach() + x
-    # This allows gradients to safely pass through the rounding operation if we ever train through it.
-    x_scaled = x / scale
-    x_rounded = torch.clamp(torch.round(x_scaled), q_min, q_max)
-    x_q = (x_rounded - x_scaled).detach() + x_scaled
+        # Compute scale per group (over the group_size dimension)
+        group_dim = dim + 1 if dim >= 0 else -1
+        max_val = x_grouped.abs().amax(dim=group_dim, keepdim=True)
+        max_val = torch.clamp(max_val, min=1e-8)
+        scale = max_val / q_max
 
-    # 5. Dequantize: Multiply back by scale to simulate the precision loss in BF16 space
-    return x_q * scale
+        # Quantize
+        x_scaled = x_grouped / scale
+        x_rounded = torch.clamp(torch.round(x_scaled), q_min, q_max)
+        x_q = (x_rounded - x_scaled).detach() + x_scaled
+        x_q = x_q * scale
+
+        # Reshape back
+        x_q = x_q.reshape(x.shape)
+
+        # Remove padding
+        if remainder != 0:
+            x_q = x_q.narrow(dim, 0, dim_size)
+
+        return x_q
+    else:
+        # Per-token / per-channel quantization (original behavior)
+        max_val = x.abs().amax(dim=dim, keepdim=True)
+        max_val = torch.clamp(max_val, min=1e-8)
+        scale = max_val / q_max
+
+        x_scaled = x / scale
+        x_rounded = torch.clamp(torch.round(x_scaled), q_min, q_max)
+        x_q = (x_rounded - x_scaled).detach() + x_scaled
+
+        return x_q * scale
 
 
 class QuantizedLinear(nn.Module):
     """
     A drop-in replacement for nn.Linear that simulates W_bits / A_bits quantization
-    during the forward pass. This is used exclusively during evaluation to measure
-    the Perplexity collapse of the model.
+    during the forward pass.
+
+    Supports both per-token and group quantization for activations.
+    Weights are always quantized per-channel (per output row).
     """
 
-    def __init__(self, base_layer: nn.Linear, w_bits: int = 4, a_bits: int = 4):
+    def __init__(self, base_layer: nn.Linear, w_bits: int = 4, a_bits: int = 4, group_size: int = -1):
         super().__init__()
         self.in_features = base_layer.in_features
         self.out_features = base_layer.out_features
         self.w_bits = w_bits
         self.a_bits = a_bits
+        self.group_size = group_size
 
-        # We hold a reference to the original weights and biases
         self.weight = base_layer.weight
         self.bias = base_layer.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Dynamically quantizes both the activations and the weights before
-        computing the linear projection.
-        """
-        # 1. Quantize Activations (Token-wise: scale is computed per token across the hidden dim)
-        x_q = symmetric_fake_quantize(x, bits=self.a_bits, dim=-1)
+        # Quantize activations (per-token or grouped along hidden dim)
+        x_q = symmetric_fake_quantize(x, bits=self.a_bits, dim=-1, group_size=self.group_size)
 
-        # 2. Quantize Weights (Channel-wise: scale is computed per output channel across the input dim)
+        # Quantize weights (always per-channel, no grouping)
         w_q = symmetric_fake_quantize(self.weight, bits=self.w_bits, dim=1)
 
-        # 3. Compute the linear projection using the aggressively degraded tensors
         return nn.functional.linear(x_q, w_q, self.bias)
