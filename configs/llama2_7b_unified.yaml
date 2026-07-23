@@ -1,0 +1,13 @@
+# Architecture
+model_id: "meta-llama/Llama-2-7b-hf"
+modality: "LoRA"
+lora_r: 16
+where: "Unified"  # Applies both Attention and MLP gauges
+
+# Optimization
+learning_rate: 2.0e-4
+steps: 8192
+penalty_weight: 0.1
+
+# Artifacts
+output_dir: "checkpoints/run_llama2_7b_unified"

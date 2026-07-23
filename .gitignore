@@ -1,0 +1,22 @@
+# Python environment and cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+env/
+
+# IDEs
+.idea/
+.vscode/
+
+# Model Weights and Artifacts (CRITICAL)
+checkpoints/
+outputs/
+*.pt
+*.bin
+*.safetensors
+*.h5
+
+# Jupyter
+.ipynb_checkpoints/
