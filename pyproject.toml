@@ -9,12 +9,13 @@ dependencies = [
     "datasets>=4.8.5",
     "einops>=0.8.2",
     "evaluate>=0.4.6",
+    "lm-eval>=0.4.0",
     "peft>=0.19.1",
     "pytest>=9.1.1",
     "scipy>=1.17.1",
     "sentencepiece>=0.2.1",
-    "torch>=2.5.1",
-    "torchaudio>=2.5.1",
+    "torch>=2.8.0",
+    "torchaudio>=2.8.0",
     "torchvision>=0.20.1",
     "transformers>=5.9.0",
 ]
@@ -25,3 +26,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["gauge_quant*", "scripts*"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
